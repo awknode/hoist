@@ -228,8 +228,11 @@ impl Engine {
     }
 
     /// Runs the gain law for the next CR samples and sets up the interpolation.
+    /// `snap`: a new peak just arrived: the detector, lift and reduction jump to it and
+    /// the gain lands on this sample (no 16-sample ramp), so onsets after quiet passages
+    /// aren't boosted by the lift that was up a moment ago.
     #[inline]
-    fn control(&mut self, st: &State) {
+    fn control(&mut self, st: &State, snap: bool) {
         if (st.speed - self.speed_at).abs() > 1e-4 {
             let (det, mem, depth, rise, rel) = speed_times(st.speed);
             let cr = CR as f32 / self.sr;
@@ -263,12 +266,17 @@ impl Engine {
         for ch in 0..chans {
             let (up_t, down_t) = law(levels[ch], st.low, st.high);
             // net gain falling (lift dropping or reduction growing): fast; rising: slow
-            let c = if up_t < self.up[ch] { self.fast } else { self.up_rise };
+            let c = if up_t < self.up[ch] { if snap { 0.0 } else { self.fast } } else { self.up_rise };
             self.up[ch] = up_t + c * (self.up[ch] - up_t);
-            let c = if down_t > self.down[ch] { self.fast } else { self.down_rel };
+            let c = if down_t > self.down[ch] { if snap { 0.0 } else { self.fast } } else { self.down_rel };
             self.down[ch] = down_t + c * (self.down[ch] - down_t);
             let target = 10f32.powf((self.up[ch] - self.down[ch] + mk) * 0.05);
-            self.dg[ch] = (target - self.g[ch]) / CR as f32;
+            if snap && target < self.g[ch] {
+                self.g[ch] = target;
+                self.dg[ch] = 0.0;
+            } else {
+                self.dg[ch] = (target - self.g[ch]) / CR as f32;
+            }
         }
         if st.link {
             self.up[1] = self.up[0];
@@ -288,8 +296,11 @@ impl Engine {
             // block peak (the detector runs at control rate)
             self.pk[0] = self.pk[0].max(x0.abs());
             self.pk[1] = self.pk[1].max(x1.abs());
-            if self.n == 0 {
-                self.control(st);
+            // a new peak more than 1 dB over the detector: act on this very sample
+            let snap = x0.abs() > self.env[0] * 1.122 || x1.abs() > self.env[1] * 1.122;
+            if self.n == 0 || snap {
+                self.control(st, snap);
+                self.n = 0;
             }
             self.n = (self.n + 1) % CR;
             self.g[0] += self.dg[0];
