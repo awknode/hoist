@@ -1,6 +1,6 @@
 [package]
 name = "hoist"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 authors = ["awk studios"]
 description = "HOIST: upward + downward level compressor, zero latency, tiny CPU"
@@ -12,15 +12,12 @@ members = ["xtask"]
 crate-type = ["cdylib", "lib"]
 
 [dependencies]
-nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git" }
-nih_plug_egui = { git = "https://github.com/robbert-vdh/nih-plug.git" }
+# AWKNODE: our nice-plug fork (codeberg RustAudio/nice-plug + awk studios patches), mounted at /nice-plug-awk by build.sh
+nice-plug = { path = "/nice-plug-awk/crates/nice-plug" }
+nice-plug-egui = { path = "/nice-plug-awk/crates/nice-plug-egui" }
 serde_json = "1"
+egui = { version = "0.37.0", default-features = false, features = ["bytemuck"] }
 
 [profile.release]
 lto = "thin"
 strip = "symbols"
-
-# AWKNODE: patched nih-plug, mounted at /nih-plug-awk by build.sh
-[patch."https://github.com/robbert-vdh/nih-plug.git"]
-nih_plug = { path = "/nih-plug-awk" }
-nih_plug_egui = { path = "/nih-plug-awk/nih_plug_egui" }

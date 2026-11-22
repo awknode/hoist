@@ -15,8 +15,8 @@
 //! lift eases up instead of snapping up (no pumping room / hiss), while dense material
 //! still gets the full squash.
 
-use nih_plug::prelude::*;
-use nih_plug_egui::EguiState;
+use nice_plug::prelude::*;
+use nice_plug_egui::{EguiEditor, EguiEditorState, RepaintNotifier};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
@@ -63,8 +63,6 @@ fn put(a: &AtomicU32, v: f32) {
 
 #[derive(Params)]
 pub struct HoistParams {
-    #[persist = "editor-state"]
-    pub editor_state: Arc<EguiState>,
     #[id = "low"]
     pub low: FloatParam,
     #[id = "high"]
@@ -88,7 +86,6 @@ fn db_param(name: &str, def: f32, min: f32, max: f32) -> FloatParam {
 impl Default for HoistParams {
     fn default() -> Self {
         Self {
-            editor_state: EguiState::from_size(editor::WIDTH, editor::HEIGHT),
             low: db_param("Low Level", 0.0, 0.0, LOW_MAX),
             high: db_param("High Level", 0.0, 0.0, HIGH_MAX),
             out: db_param("Output", 0.0, -24.0, 12.0),
@@ -327,11 +324,15 @@ pub struct Hoist {
     params: Arc<HoistParams>,
     shared: Arc<Shared>,
     eng: Engine,
+    /// window size + open flag (nice-plug keeps it on the plugin, not in the params)
+    editor_state: Arc<EguiEditorState>,
+    /// realtime-safe "please repaint" from the audio thread (nice-plug-egui no longer repaints by itself)
+    repaint: RepaintNotifier,
 }
 impl Default for Hoist {
     fn default() -> Self {
         let shared = Arc::new(Shared::default());
-        Self { params: Arc::new(HoistParams::default()), shared: shared.clone(), eng: Engine::new(48000.0).with_shared(shared) }
+        Self { params: Arc::new(HoistParams::default()), shared: shared.clone(), eng: Engine::new(48000.0).with_shared(shared), editor_state: EguiEditorState::from_size(nice_plug::editor::dpi::LogicalSize::new(editor::WIDTH as f64, editor::HEIGHT as f64), 1.0), repaint: RepaintNotifier::new() }
     }
 }
 
@@ -344,16 +345,17 @@ impl Plugin for Hoist {
     const AUDIO_IO_LAYOUTS: &'static [AudioIOLayout] = &[AudioIOLayout { main_input_channels: NonZeroU32::new(2), main_output_channels: NonZeroU32::new(2), ..AudioIOLayout::const_default() }];
     const MIDI_INPUT: MidiConfig = MidiConfig::None;
     const SAMPLE_ACCURATE_AUTOMATION: bool = false;
+    type Editor = EguiEditor<editor::HoistEditor>;
     type SysExMessage = ();
     type BackgroundTask = ();
 
     fn params(&self) -> Arc<dyn Params> {
         self.params.clone()
     }
-    fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
-        editor::create(self.params.clone(), self.shared.clone())
+    fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Self::Editor> {
+        editor::create(self.editor_state.clone(), self.repaint.clone(), self.params.clone(), self.shared.clone())
     }
-    fn initialize(&mut self, _layout: &AudioIOLayout, cfg: &BufferConfig, _ctx: &mut impl InitContext<Self>) -> bool {
+    fn activate(&mut self, _layout: &AudioIOLayout, cfg: &BufferConfig, _ctx: &mut impl ActivateContext<Self>) -> bool {
         self.eng = Engine::new(cfg.sample_rate).with_shared(self.shared.clone());
         true
     }
@@ -385,6 +387,10 @@ impl Plugin for Hoist {
             p.out.smoothed.next_step(n);
             p.speed.smoothed.next_step(n);
         }
+        // meters moved: ask the open window to repaint (realtime-safe, coalesced)
+        if self.editor_state.is_open() {
+            self.repaint.request_repaint();
+        }
         ProcessStatus::Normal
     }
 }
@@ -401,5 +407,5 @@ impl Vst3Plugin for Hoist {
     const VST3_SUBCATEGORIES: &'static [Vst3SubCategory] = &[Vst3SubCategory::Fx, Vst3SubCategory::Dynamics];
 }
 
-nih_export_clap!(Hoist);
-nih_export_vst3!(Hoist);
+nice_export_clap!(Hoist);
+nice_export_vst3!(Hoist);

@@ -4,9 +4,10 @@
 use crate::awk_ui::*;
 use crate::presets::PresetBar;
 use crate::{get, HoistParams, Shared, HIGH_MAX, LOW_MAX};
-use nih_plug::prelude::*;
-use nih_plug_egui::create_egui_editor;
-use nih_plug_egui::egui::{self, pos2, vec2, Align2, Color32, Pos2, Rect, Response, Sense, Shape, Stroke};
+use nice_plug::context::gui::GuiContext;
+use nice_plug::prelude::*;
+use nice_plug_egui::{create_egui_editor, EguiEditor, EguiEditorState, EguiNiceSettings, NiceEguiApp, RepaintNotifier};
+use egui::{pos2, vec2, Align2, Color32, Rect, Response, Sense, Shape, Stroke};
 use std::sync::Arc;
 
 pub const WIDTH: u32 = 780;
@@ -32,9 +33,31 @@ fn new_state(name: &'static str) -> St {
     St { presets: PresetBar::new(name), skin: Skin::new(Look::Machined, YEL, "HOIST", env!("CARGO_PKG_VERSION"), "") }
 }
 
-pub(crate) fn create(params: Arc<HoistParams>, shared: Arc<Shared>) -> Option<Box<dyn Editor>> {
-    let state = params.editor_state.clone();
-    create_egui_editor(state, new_state("Hoist"), |ctx, _| install_fonts(ctx), move |ctx, setter, st| frame(ctx, setter, st, params.as_ref(), shared.as_ref()))
+/// The editor app (nice-plug-egui): lives as long as the plugin, the GUI context only
+/// while the window is open.
+pub struct HoistEditor {
+    params: Arc<HoistParams>,
+    shared: Arc<Shared>,
+    st: St,
+    gui: Option<GuiContext>,
+}
+impl NiceEguiApp for HoistEditor {
+    fn build(&mut self, egui_ctx: egui::Context, gui: GuiContext, _f: &mut nice_plug_egui::Frame) -> Result<(), nice_plug_egui::baseview::HandlerError> {
+        install_fonts(&egui_ctx);
+        self.gui = Some(gui);
+        Ok(())
+    }
+    fn ui(&mut self, ui: &mut egui::Ui, _f: &mut nice_plug_egui::Frame) {
+        let Some(gui) = self.gui.as_ref() else { return };
+        let setter = gui.param_setter();
+        frame(ui, &setter, &mut self.st, &self.params, &self.shared);
+    }
+    fn editor_closed(&mut self) {
+        self.gui = None;
+    }
+}
+pub(crate) fn create(state: Arc<EguiEditorState>, repaint: RepaintNotifier, params: Arc<HoistParams>, shared: Arc<Shared>) -> Option<EguiEditor<HoistEditor>> {
+    create_egui_editor(state, repaint, EguiNiceSettings::default(), HoistEditor { params, shared, st: new_state("Hoist"), gui: None })
 }
 
 fn alpha(c: Color32, a: f32) -> Color32 {
@@ -54,10 +77,10 @@ fn hazard(pa: &Painter, r: Rect) {
         x += 20.0;
     }
 }
-use nih_plug_egui::egui::Painter;
+use egui::Painter;
 
-fn pill(ui: &mut egui::Ui, r: Rect, s: &str, on: bool, id: impl std::hash::Hash) -> Response {
-    let resp = ui.interact(r, ui.id().with(("pill", id)), Sense::click());
+fn pill(ui: &mut egui::Ui, r: Rect, s: &str, on: bool, id: impl std::hash::Hash + std::fmt::Debug) -> Response {
+    let resp = ui.interact(r, ui.scope_id().with(("pill", id)), Sense::click());
     let pa = ui.painter();
     pa.rect_filled(r, r.height() * 0.5, if on { YEL } else if resp.hovered() { rgb(0x2a, 0x2b, 0x2e) } else { PANEL });
     pa.rect_stroke(r, r.height() * 0.5, Stroke::new(1.0, if on { YEL } else { EDGE }), egui::StrokeKind::Inside);
@@ -70,7 +93,7 @@ fn pill(ui: &mut egui::Ui, r: Rect, s: &str, on: bool, id: impl std::hash::Hash)
 #[allow(clippy::too_many_arguments)]
 fn fader(ui: &mut egui::Ui, setter: &ParamSetter, param: &FloatParam, cx: f32, top: f32, bot: f32, label: &str, marks: &[(f32, &str)], from_mid: bool, fmt: &dyn Fn(f32) -> String) -> Response {
     let col = Rect::from_min_max(pos2(cx - 40.0, top - 14.0), pos2(cx + 40.0, bot + 14.0));
-    let id = ui.id().with(("fader", label));
+    let id = ui.scope_id().with(("fader", label));
     let resp = ui.interact(col, id, Sense::click_and_drag());
     let span = bot - top;
     let mut v = param.unmodulated_normalized_value();
@@ -93,7 +116,7 @@ fn fader(ui: &mut egui::Ui, setter: &ParamSetter, param: &FloatParam, cx: f32, t
             setter.end_set_parameter(param);
         }
         if resp.hovered() {
-            let w = ui.input(|i| i.raw_scroll_delta.y);
+            let w: f32 = ui.input(|i| i.events.iter().map(|e| if let egui::Event::MouseWheel { delta, .. } = e { delta.y } else { 0.0 }).sum());
             if w != 0.0 {
                 v = (v + w.signum() * 0.01).clamp(0.0, 1.0);
                 setter.begin_set_parameter(param);
@@ -154,10 +177,11 @@ fn bar(pa: &Painter, r: Rect, u: f32, col: Color32, label: &str) {
     txt(pa, pos2(r.center().x, r.bottom() + 14.0), Align2::CENTER_CENTER, label, labb(11.0), DIM, 1.5);
 }
 
-fn frame(ctx: &egui::Context, setter: &ParamSetter, st: &mut St, p: &HoistParams, sh: &Shared) {
+fn frame(root: &mut egui::Ui, setter: &ParamSetter, st: &mut St, p: &HoistParams, sh: &Shared) {
+    let ctx = root.ctx().clone();
     ctx.request_repaint_after(std::time::Duration::from_millis(16));
-    st.skin.begin(ctx);
-    egui::CentralPanel::default().frame(egui::Frame::NONE.fill(BG)).show(ctx, |ui| {
+    st.skin.begin(&ctx);
+    egui::CentralPanel::default().frame(egui::Frame::NONE.fill(BG)).show(root, |ui| {
         let whole = ui.max_rect();
         let o = whole.min.to_vec2() + vec2(30.0, TOP);
         let at = |x: f32, y: f32| pos2(x, y) + o;
@@ -238,19 +262,17 @@ fn frame(ctx: &egui::Context, setter: &ParamSetter, st: &mut St, p: &HoistParams
 mod tests {
     use super::*;
     use crate::{Engine, State};
-    use nih_plug::context::gui::GuiContext;
-    use nih_plug::wrapper::state::PluginState;
-    use nih_plug_egui::egui::{epaint, Event, ImageData, Modifiers, PointerButton, RawInput, TextureId, TextureWrapMode, Vec2};
+    use nice_plug::context::gui::GuiContextInner;
+    use nice_plug::plugin::PluginState;
+    use egui::{epaint, Event, Pos2, ImageData, Modifiers, PointerButton, RawInput, TextureId, TextureWrapMode, Vec2};
     use std::collections::HashMap;
 
     struct Mock;
-    impl GuiContext for Mock {
+    impl GuiContextInner for Mock {
         fn plugin_api(&self) -> PluginApi {
             PluginApi::Vst3
         }
-        fn request_resize(&self) -> bool {
-            true
-        }
+        fn request_restart(&self) {}
         unsafe fn raw_begin_set_parameter(&self, _p: ParamPtr) {}
         unsafe fn raw_set_parameter_normalized(&self, _p: ParamPtr, _n: f32) {}
         unsafe fn raw_end_set_parameter(&self, _p: ParamPtr) {}
@@ -266,21 +288,23 @@ mod tests {
         repeat: bool,
     }
     fn apply_delta(texs: &mut HashMap<TextureId, Tex>, out: &egui::FullOutput) {
-        for (id, d) in &out.textures_delta.set {
-            let (w, h, px): (usize, usize, Vec<[f32; 4]>) = match &d.image {
-                ImageData::Color(c) => (c.size[0], c.size[1], c.pixels.iter().map(|p| [p.r() as f32 / 255.0, p.g() as f32 / 255.0, p.b() as f32 / 255.0, p.a() as f32 / 255.0]).collect()),
-                ImageData::Font(f) => (f.size[0], f.size[1], f.srgba_pixels(None).map(|p| [p.r() as f32 / 255.0, p.g() as f32 / 255.0, p.b() as f32 / 255.0, p.a() as f32 / 255.0]).collect()),
-            };
-            let repeat = d.options.wrap_mode == TextureWrapMode::Repeat;
-            if let Some(pos) = d.pos {
-                let t = texs.get_mut(id).unwrap();
-                for y in 0..h {
-                    for x in 0..w {
-                        t.px[(pos[1] + y) * t.w + pos[0] + x] = px[y * w + x];
+        // egui 0.37: several deltas per texture, and the font atlas is a plain colour image
+        for (id, ds) in &out.textures_delta.set {
+            for d in ds.iter() {
+                let ImageData::Color(c) = &d.image;
+                let (w, h) = (c.size[0], c.size[1]);
+                let px: Vec<[f32; 4]> = c.pixels.iter().map(|p| [p.r() as f32 / 255.0, p.g() as f32 / 255.0, p.b() as f32 / 255.0, p.a() as f32 / 255.0]).collect();
+                let repeat = d.options.wrap_mode == TextureWrapMode::Repeat;
+                if let Some(pos) = d.pos {
+                    let t = texs.get_mut(id).unwrap();
+                    for y in 0..h {
+                        for x in 0..w {
+                            t.px[(pos[1] + y) * t.w + pos[0] + x] = px[y * w + x];
+                        }
                     }
+                } else {
+                    texs.insert(*id, Tex { w, h, px, repeat });
                 }
-            } else {
-                texs.insert(*id, Tex { w, h, px, repeat });
             }
         }
     }
@@ -372,8 +396,8 @@ mod tests {
         for y in (50..466).step_by(17) {
             for x in (6..776).step_by(29) {
                 let q = Pos2::new(x as f32, y as f32);
-                let _ = ctx.run(raw(i, vec![Event::PointerMoved(q), Event::PointerButton { pos: q, button: PointerButton::Primary, pressed: true, modifiers: Modifiers::NONE }]), |c| frame(c, &setter, &mut st, &p, &sh));
-                let _ = ctx.run(raw(i + 1, vec![Event::PointerButton { pos: q, button: PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE }]), |c| frame(c, &setter, &mut st, &p, &sh));
+                let _ = ctx.run_ui(raw(i, vec![Event::PointerMoved(q), Event::PointerButton { pos: q, button: PointerButton::Primary, pressed: true, modifiers: Modifiers::NONE }]), |c| frame(c, &setter, &mut st, &p, &sh));
+                let _ = ctx.run_ui(raw(i + 1, vec![Event::PointerButton { pos: q, button: PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE }]), |c| frame(c, &setter, &mut st, &p, &sh));
                 i += 2;
             }
         }
@@ -390,7 +414,7 @@ mod tests {
             let rects: Vec<Rect> = (0..labels.len()).map(|i| Rect::from_min_size(pos2(30.0 + i as f32 * 150.0, 100.0), vec2(96.0, 20.0))).collect();
             let mut last = None;
             for f in 0..3 {
-                let out = ctx.run(raw(f, vec![]), |c| {
+                let out = ctx.run_ui(raw(f, vec![]), |c| {
                     egui::CentralPanel::default().frame(egui::Frame::NONE.fill(BG)).show(c, |ui| {
                         for (i, r) in rects.iter().enumerate() {
                             let _ = pill(ui, *r, labels[i], on, ("t", i));
@@ -452,7 +476,7 @@ mod tests {
             let mut st = new_state("HoistShot");
             let mut last = None;
             for f in 0..3 {
-                last = Some(ctx.run(raw(n * 10 + f, vec![]), |c| frame(c, &setter, &mut st, &p, &sh)));
+                last = Some(ctx.run_ui(raw(n * 10 + f, vec![]), |c| frame(c, &setter, &mut st, &p, &sh)));
                 if f < 2 {
                     apply_delta(&mut texs, last.as_ref().unwrap());
                 }

@@ -1,5 +1,5 @@
 //! Factory presets: validated against the real params, played (bounded), written with PRESET_OUT.
-use nih_plug::prelude::*;
+use nice_plug::prelude::*;
 use serde_json::{json, Map, Value};
 use hoist::*;
 
@@ -55,7 +55,7 @@ fn factory_presets_are_valid() {
     for p in PRESETS {
         assert!(!p.0.contains('/'));
         let v = build(&params, p.1);
-        let _: nih_plug::wrapper::state::PluginState = serde_json::from_value(v.clone()).unwrap();
+        let _: nice_plug::plugin::PluginState = serde_json::from_value(v.clone()).unwrap();
         let mut st = State::default();
         for (id, x) in p.1 {
             match *id {
