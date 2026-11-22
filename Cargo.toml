@@ -21,3 +21,7 @@ egui = { version = "0.37.0", default-features = false, features = ["bytemuck"] }
 [profile.release]
 lto = "thin"
 strip = "symbols"
+
+# FL Studio fixes: patched baseview (vsync, paint, DPI, dummy-window crash). See nice-plug-awk/patches.
+[patch.crates-io]
+baseview = { path = "/nice-plug-awk/patches/baseview-0.4.2" }
