@@ -57,6 +57,7 @@ impl NiceEguiApp for HoistEditor {
     }
 }
 pub(crate) fn create(state: Arc<EguiEditorState>, repaint: RepaintNotifier, params: Arc<HoistParams>, shared: Arc<Shared>) -> Option<EguiEditor<HoistEditor>> {
+    crate::presets::apply_scale(&state, &params.ui_scale);
     create_egui_editor(state, repaint, EguiNiceSettings::default(), HoistEditor { params, shared, st: new_state("Hoist"), gui: None })
 }
 
@@ -254,7 +255,7 @@ fn frame(root: &mut egui::Ui, setter: &ParamSetter, st: &mut St, p: &HoistParams
         txt(&pa, pos2(o.x + 214.0, cy), Align2::LEFT_CENTER, "LATENCY 0", mono(10.0), DIM, 1.5);
         txt(&pa, pos2(o.x + 704.0, cy), Align2::RIGHT_CENTER, format!("awk studios · hoist v{}", env!("CARGO_PKG_VERSION")), mono(10.0), DIM, 1.0);
         let _ = (LOW_MAX, HIGH_MAX);
-        let _ = st.presets.strip(ui, setter, p, whole, &st.skin, &p.mix, &p.bypass);
+        let _ = st.presets.strip(ui, setter, p, whole, &st.skin, &p.mix, &p.bypass, &p.ui_scale);
     });
 }
 

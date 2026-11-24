@@ -28,10 +28,16 @@ mod presets;
 const CR: usize = 16;
 pub const LOW_MAX: f32 = 48.0;
 pub const HIGH_MAX: f32 = 48.0;
-/// LOW LEVEL lifts what sits below this (dBFS) ...
-const UP_THRESH: f32 = -10.0;
-/// ... by 3/4 of the distance (a 4:1 upward slope), capped by LOW LEVEL.
-const UP_SLOPE: f32 = 0.75;
+/// LOW LEVEL (0.3.0, fitted to Waves MV2, awk-bench 2026-11-22): the lift threshold rises with the knob
+/// (UP_T0 + LOW dBFS), slope 0.85 dB per dB below it, capped by LOW through a 48 dB soft knee, and the
+/// lift fades out softly (24 dB) instead of stopping dead. So the whole knob works: LOW 48 still lifts
+/// a 0 dBFS signal by ~17 dB, like MV2 (0.2.x stopped above -10 dBFS and topped out near +20 dB).
+const UP_T0: f32 = -24.0;
+const UP_SLOPE: f32 = 0.85;
+const UP_KNEE: f32 = 48.0;
+const UP_FADE: f32 = 24.0;
+/// SPEED 50 % lands on MV2's recovery (~350-550 ms); 0.2.x was ~1.6x quicker.
+const TIME_SCALE: f32 = 1.6;
 /// Below FLOOR the lift fades out over FLOOR_W dB, so silence / dither / hiss isn't pulled up.
 const FLOOR: f32 = -70.0;
 const FLOOR_W: f32 = 20.0;
@@ -40,7 +46,7 @@ const HOLD: f32 = 0.010;
 /// HIGH LEVEL: 10:1 above a threshold at -HIGH, 6 dB knee, makeup = the reduction a 0 dBFS peak gets.
 /// It fades in over the first 3 dB of travel, so HIGH 0 is truly off (no knee, no makeup).
 const DOWN_SLOPE: f32 = 0.9;
-const KNEE: f32 = 6.0;
+const KNEE: f32 = 12.0;
 
 pub struct Shared {
     pub meters: awk_ui::Meters,
@@ -79,6 +85,9 @@ pub struct HoistParams {
     pub safe: BoolParam,
     #[id = "bypass"]
     pub bypass: BoolParam,
+    /// Window size (1.0 = 100%), saved with the project. 0 = not set: open at the default.
+    #[persist = "ui-scale"]
+    pub ui_scale: Arc<std::sync::RwLock<f32>>,
 }
 fn db_param(name: &str, def: f32, min: f32, max: f32) -> FloatParam {
     FloatParam::new(name, def, FloatRange::Linear { min, max }).with_smoother(SmoothingStyle::Linear(30.0)).with_unit(" dB").with_value_to_string(formatters::v2s_f32_rounded(1))
@@ -98,6 +107,7 @@ impl Default for HoistParams {
             mix: awk_ui::mix_param(),
             safe: awk_ui::safe_param(),
             bypass: awk_ui::bypass_param(),
+            ui_scale: Arc::new(std::sync::RwLock::new(0.0)),
         }
     }
 }
@@ -122,8 +132,20 @@ impl Default for State {
 
 /// The gain law: detector level (dBFS) -> (lift dB, reduction dB). Pure, so the UI can draw it.
 pub fn law(level: f32, low: f32, high: f32) -> (f32, f32) {
-    let mut up = ((UP_THRESH - level) * UP_SLOPE).clamp(0.0, low);
-    up *= ((level - (FLOOR - FLOOR_W)) / FLOOR_W).clamp(0.0, 1.0);
+    let (up, down) = law_raw(level, low, high);
+    (up * floor_k(level), down)
+}
+/// How much of the lift survives at this level: none in silence / hiss (below FLOOR - FLOOR_W).
+pub fn floor_k(level: f32) -> f32 {
+    ((level - (FLOOR - FLOOR_W)) / FLOOR_W).clamp(0.0, 1.0)
+}
+/// The law before the hiss floor. The engine keeps its lift state on this, and applies
+/// floor_k at the output, so after silence the lift is already where the next hit needs it
+/// (the first of two identical kicks used to come out ~2 dB quieter than the second).
+pub fn law_raw(level: f32, low: f32, high: f32) -> (f32, f32) {
+    let x = smin(low, UP_SLOPE * (UP_T0 + low - level), UP_KNEE);
+    // soft floor at 0 dB; fades in over the first 3 dB of LOW so LOW 0 is truly off
+    let up = (-smin(-x, 0.0, UP_FADE)).clamp(0.0, low) * (low / 3.0).clamp(0.0, 1.0);
     let over = level + up + high;
     let down = if 2.0 * over < -KNEE {
         0.0
@@ -133,6 +155,17 @@ pub fn law(level: f32, low: f32, high: f32) -> (f32, f32) {
         DOWN_SLOPE * over
     };
     (up, down * (high / 3.0).clamp(0.0, 1.0))
+}
+/// smooth minimum of a and b with a quadratic knee w dB wide
+fn smin(a: f32, b: f32, w: f32) -> f32 {
+    let d = a - b;
+    if d > 0.5 * w {
+        b
+    } else if d < -0.5 * w {
+        a
+    } else {
+        0.5 * (a + b) - (d * d / (2.0 * w) + w / 8.0)
+    }
 }
 /// HIGH LEVEL makeup: what a 0 dBFS peak loses, given back.
 pub fn makeup(high: f32) -> f32 {
@@ -144,7 +177,8 @@ pub fn makeup(high: f32) -> f32 {
 pub fn speed_times(s: f32) -> (f32, f32, f32, f32, f32) {
     let s = s.clamp(0.0, 1.0);
     let li = |a: f32, b: f32| a * (b / a).powf(s);
-    (li(0.120, 0.030), li(0.6, 0.10), 14.0 + 18.0 * s, li(0.25, 0.03), li(0.25, 0.04))
+    let k = TIME_SCALE;
+    (k * li(0.120, 0.030), k * li(0.6, 0.10), 14.0 + 18.0 * s, k * li(0.25, 0.03), k * li(0.25, 0.04))
 }
 
 pub struct Engine {
@@ -166,6 +200,8 @@ pub struct Engine {
     /// smoothed lift / reduction per channel (dB)
     up: [f32; 2],
     down: [f32; 2],
+    /// hiss-floor factor per channel (lift shown / applied = up * fk)
+    fk: [f32; 2],
     /// gain now and per-sample step (linear), per channel
     g: [f32; 2],
     dg: [f32; 2],
@@ -196,6 +232,7 @@ impl Engine {
             mem_k: 0.0,
             up_rise: 0.0,
             down_rel: 0.0,
+            fk: [1.0; 2],
             up: [0.0; 2],
             down: [0.0; 2],
             g: [1.0; 2],
@@ -261,13 +298,15 @@ impl Engine {
         let mk = makeup(st.high) + st.out_db;
         let chans = if st.link { 1 } else { 2 };
         for ch in 0..chans {
-            let (up_t, down_t) = law(levels[ch], st.low, st.high);
+            let (up_t, down_t) = law_raw(levels[ch], st.low, st.high);
+            let fk = floor_k(levels[ch]);
+            self.fk[ch] = fk;
             // net gain falling (lift dropping or reduction growing): fast; rising: slow
             let c = if up_t < self.up[ch] { if snap { 0.0 } else { self.fast } } else { self.up_rise };
             self.up[ch] = up_t + c * (self.up[ch] - up_t);
             let c = if down_t > self.down[ch] { if snap { 0.0 } else { self.fast } } else { self.down_rel };
             self.down[ch] = down_t + c * (self.down[ch] - down_t);
-            let target = 10f32.powf((self.up[ch] - self.down[ch] + mk) * 0.05);
+            let target = 10f32.powf((self.up[ch] * fk - self.down[ch] + mk) * 0.05);
             if snap && target < self.g[ch] {
                 self.g[ch] = target;
                 self.dg[ch] = 0.0;
@@ -276,6 +315,7 @@ impl Engine {
             }
         }
         if st.link {
+            self.fk[1] = self.fk[0];
             self.up[1] = self.up[0];
             self.down[1] = self.down[0];
             self.g[1] = self.g[0];
@@ -311,10 +351,11 @@ impl Engine {
             l[i] = y0;
             r[i] = y1;
         }
-        let ch = if self.up[0] - self.down[0] >= self.up[1] - self.down[1] { 0 } else { 1 };
-        put(&self.shared.up, self.up[ch]);
+        let u = [self.up[0] * self.fk[0], self.up[1] * self.fk[1]];
+        let ch = if u[0] - self.down[0] >= u[1] - self.down[1] { 0 } else { 1 };
+        put(&self.shared.up, u[ch]);
         put(&self.shared.down, self.down[ch]);
-        put(&self.shared.net, self.up[ch] - self.down[ch] + makeup(st.high) + st.out_db);
+        put(&self.shared.net, u[ch] - self.down[ch] + makeup(st.high) + st.out_db);
         self.meter.store(&self.shared.meters);
         self.ceil.store(&self.shared.meters);
     }
